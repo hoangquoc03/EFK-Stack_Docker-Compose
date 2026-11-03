@@ -1,0 +1,7 @@
+source "https://rubygems.org"
+
+gem "fluentd", "= 1.16.3"
+gem "msgpack", "= 1.7.2"
+gem "cool.io", "= 1.8.0"
+gem "elasticsearch", "~> 7.17.0"
+gem "fluent-plugin-elasticsearch", "= 5.4.4"

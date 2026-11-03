@@ -1,0 +1,15 @@
+.env
+__pycache__/
+*.py[cod]
+*.log
+*.log.*
+*.tmp
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Runtime data must not be committed.
+fluentd/buffer/
+data/
+elasticsearch-data/

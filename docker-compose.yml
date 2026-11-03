@@ -1,0 +1,117 @@
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.17.0
+    environment:
+      discovery.type: single-node
+      ES_JAVA_OPTS: ${ES_JAVA_OPTS:-"-Xms512m -Xmx512m"}
+    ports:
+      - "127.0.0.1:9200:9200"
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    networks:
+      - efk
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "curl -fsS 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=2s' >/dev/null || exit 1"
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+    restart: unless-stopped
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:7.17.0
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+    ports:
+      - "127.0.0.1:5601:5601"
+    networks:
+      - efk
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "curl -fsS http://localhost:5601/api/status >/dev/null || exit 1"
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+    restart: unless-stopped
+
+  fluentd:
+    build:
+      context: ./fluentd
+    ports:
+      - "127.0.0.1:24224:24224"
+    volumes:
+      - fluentd-buffer:/fluentd/buffer
+    networks:
+      - efk
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - ruby
+        - -rsocket
+        - -e
+        - "TCPSocket.new('127.0.0.1', 24224).close"
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+  api-one:
+    build:
+      context: ./app
+    environment:
+      APP_SERVICE_NAME: api-one
+      APP_LOG_INTERVAL_SECONDS: ${APP_LOG_INTERVAL_SECONDS:-5}
+    depends_on:
+      fluentd:
+        condition: service_healthy
+    networks:
+      - efk
+    logging:
+      driver: fluentd
+      options:
+        fluentd-address: "127.0.0.1:24224"
+        fluentd-async: "true"
+        fluentd-async-reconnect-interval: "5s"
+        fluentd-buffer-limit: "1048576"
+        tag: quickbite.api-one
+    restart: unless-stopped
+
+  api-two:
+    build:
+      context: ./app
+    environment:
+      APP_SERVICE_NAME: api-two
+      APP_LOG_INTERVAL_SECONDS: ${APP_LOG_INTERVAL_SECONDS:-5}
+    depends_on:
+      fluentd:
+        condition: service_healthy
+    networks:
+      - efk
+    logging:
+      driver: fluentd
+      options:
+        fluentd-address: "127.0.0.1:24224"
+        fluentd-async: "true"
+        fluentd-async-reconnect-interval: "5s"
+        fluentd-buffer-limit: "1048576"
+        tag: quickbite.api-two
+    restart: unless-stopped
+
+networks:
+  efk:
+    driver: bridge
+
+volumes:
+  elasticsearch-data:
+  fluentd-buffer:
