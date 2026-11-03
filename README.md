@@ -32,6 +32,11 @@ EFK-Stack/
 │   ├── fluent.conf
 │   └── plugins/
 │       └── Gemfile
+├── logstash/
+│   ├── Dockerfile
+│   ├── pipeline/
+│   │   └── logstash.conf
+│   └── test_logstash.py
 └── app/
     ├── Dockerfile
     └── app.py
@@ -67,6 +72,7 @@ Trên Windows/macOS với Docker Desktop, Elasticsearch chạy trong Linux VM/WS
 ```dotenv
 ES_JAVA_OPTS=-Xms512m -Xmx512m
 APP_LOG_INTERVAL_SECONDS=5
+LOGSTASH_JAVA_OPTS=-Xms256m -Xmx256m
 ```
 
 ## 5. Khởi động
@@ -145,3 +151,110 @@ Lệnh thứ hai xóa các named volumes của project và không thể khôi ph
 - **Thiếu bộ nhớ:** giảm heap `ES_JAVA_OPTS` trong `.env` (ví dụ `-Xms256m -Xmx256m`) hoặc cấp thêm RAM cho Docker.
 
 > Docker `fluentd` logging driver gửi log container tới Fluentd. Tùy thiết lập dual logging của Docker Engine, `docker compose logs api-one` có thể không hiển thị log; hãy kiểm tra sự kiện ứng dụng trong Kibana và tình trạng nhận log trong Fluentd.
+
+## 10. Bài thực hành 2 — Logstash nhận log TCP từ Spring Boot
+
+### Mục tiêu và luồng dữ liệu
+
+Bài thực hành này bổ sung Logstash 7.17.0 vào network Compose hiện có. Ứng dụng Spring Boot gửi mỗi log JSON trên một dòng qua TCP đến `localhost:5000`; Logstash parse sự kiện, in bản ghi đã parse ra stdout và gửi đến Elasticsearch. Dữ liệu bài 1 qua Fluentd vẫn chạy độc lập.
+
+```text
+Spring Boot -- TCP :5000 / JSON Lines --> Logstash
+                                            ├── stdout (rubydebug)
+                                            └── HTTP :9200 --> Elasticsearch
+                                                               └── Kibana
+```
+
+Port `5000` chỉ bind trên loopback host. Trong container network, Logstash kết nối Elasticsearch bằng hostname `elasticsearch` và HTTP port `9200`.
+
+### `json_lines` và pipeline
+
+File [logstash.conf](./logstash/pipeline/logstash.conf) cấu hình input TCP trên cổng `5000` với `codec => json_lines`. Mỗi sự kiện phải là một JSON object hợp lệ kết thúc bằng newline (`\n`). Codec giải mã JSON thành các trường event độc lập, ví dụ `service`, `level`, `message` và `order_id`, không lưu cả JSON thành một chuỗi.
+
+Output Elasticsearch ghi vào index `storex-logs-%{+YYYY.MM.dd}`; output `stdout` dùng `rubydebug` để tiện xem các trường đã được parse trong log Logstash. Heap Logstash mặc định là `256 MiB` trong `.env`; điều chỉnh `LOGSTASH_JAVA_OPTS` nếu máy có thêm/ít bộ nhớ.
+
+### Khởi động Logstash
+
+Từ thư mục project:
+
+```bash
+docker compose config
+docker compose up -d --build
+docker compose ps -a
+docker compose logs -f logstash
+```
+
+Compose chờ Elasticsearch healthcheck trước khi khởi động Logstash. Lần đầu có thể cần tải image/build và chờ Logstash nạp pipeline. Kiểm tra cổng TCP trên Windows:
+
+```powershell
+Test-NetConnection localhost -Port 5000
+```
+
+### Gửi JSON kiểm thử
+
+Đã có script [test_logstash.py](./logstash/test_logstash.py). Chạy bằng Python trên host:
+
+```bash
+python logstash/test_logstash.py
+```
+
+Nếu Python chưa được cài trên host, có thể chạy script từ container Python trên cùng network Compose:
+
+```bash
+docker run --rm --network efk-stack_efk \
+  -e LOGSTASH_HOST=logstash \
+  -v "$PWD/logstash:/test:ro" \
+  python:3.12-slim python /test/test_logstash.py
+```
+
+Biến `LOGSTASH_HOST` mặc định là `localhost` cho lần chạy từ host; khi chạy trong network Compose, dùng `logstash`.
+
+Script gửi sự kiện mẫu dưới đây, kèm newline bắt buộc:
+
+```json
+{"service":"storex-backend","level":"INFO","message":"Order created successfully","order_id":1001}
+```
+
+Có thể gửi một sự kiện khác bằng Python:
+
+```python
+import json
+import socket
+
+data = {
+    "service": "storex-backend",
+    "level": "INFO",
+    "message": "Order created successfully",
+    "order_id": 1001,
+}
+
+with socket.create_connection(("localhost", 5000)) as sock:
+    sock.sendall((json.dumps(data) + "\n").encode("utf-8"))
+```
+
+Ứng dụng Spring Boot cần cấu hình appender TCP gửi JSON Lines (mỗi JSON event một dòng) tới host `localhost`, port `5000` khi chạy trên host; nếu chạy trong Compose, dùng hostname `logstash`, port `5000`. Không gửi JSON nhiều dòng nếu chưa cấu hình framing tương ứng.
+
+### Kiểm tra Elasticsearch và Kibana
+
+Sau khi gửi test event, kiểm tra index và document:
+
+```bash
+curl "http://localhost:9200/_cat/indices?v"
+curl "http://localhost:9200/storex-logs-*/_search?pretty"
+```
+
+Trong kết quả `_source`, xác nhận `service`, `level`, `message`, `order_id` là các trường riêng. Kiểm tra Logstash stdout để thấy event parse:
+
+```bash
+docker compose logs --tail=100 logstash
+```
+
+Trong [Kibana](http://localhost:5601), vào **Stack Management → Data Views**, tạo Data View `storex-logs-*`, chọn `@timestamp` làm trường thời gian, rồi mở **Discover** để xem sự kiện. Nếu chưa thấy dữ liệu, mở rộng khoảng thời gian chọn trong Discover.
+
+### Lỗi thường gặp
+
+- **Cổng `5000` đang được sử dụng:** dừng ứng dụng đang chiếm cổng hoặc đổi host port trong Compose; nếu đổi port container thì đồng thời sửa `port` trong `logstash.conf`.
+- **Logstash không khởi động / pipeline lỗi:** kiểm tra `docker compose logs logstash`, YAML bằng `docker compose config` và cú pháp pipeline trong `logstash.conf`.
+- **Không có document trong Elasticsearch:** xác nhận Elasticsearch healthy, Logstash cùng network `efk`, output host là `http://elasticsearch:9200`, và chờ pipeline flush/ghi index.
+- **Document chứa JSON nguyên chuỗi hoặc không có trường:** gửi đúng một JSON object trên mỗi dòng, kết thúc bằng `\n`, và kiểm tra input `codec => json_lines`.
+- **Không thấy document trong Kibana:** xác nhận Data View là `storex-logs-*`, trường thời gian `@timestamp` và khoảng thời gian Discover bao gồm lúc gửi test event.
