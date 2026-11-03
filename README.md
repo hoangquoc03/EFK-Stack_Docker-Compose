@@ -171,7 +171,7 @@ Port `5000` chỉ bind trên loopback host. Trong container network, Logstash k�
 
 File [logstash.conf](./logstash/pipeline/logstash.conf) cấu hình input TCP trên cổng `5000` với `codec => json_lines`. Mỗi sự kiện phải là một JSON object hợp lệ kết thúc bằng newline (`\n`). Codec giải mã JSON thành các trường event độc lập, ví dụ `service`, `level`, `message` và `order_id`, không lưu cả JSON thành một chuỗi.
 
-Output Elasticsearch ghi vào index `storex-logs-%{+YYYY.MM.dd}`; output `stdout` dùng `rubydebug` để tiện xem các trường đã được parse trong log Logstash. Heap Logstash mặc định là `256 MiB` trong `.env`; điều chỉnh `LOGSTASH_JAVA_OPTS` nếu máy có thêm/ít bộ nhớ.
+Pipeline của bài 2 ban đầu ghi vào index `storex-logs-%{+YYYY.MM.dd}`. Sau bài 3, cấu hình hiện tại định tuyến động theo `app_name`; output `stdout` vẫn dùng `rubydebug` để xem trường đã parse. Script `test_logstash.py` gửi `app_name: storex-backend`, nên ở cấu hình hiện tại event vào `storex-backend-YYYY.MM.dd`. Heap Logstash mặc định là `256 MiB` trong `.env`; điều chỉnh `LOGSTASH_JAVA_OPTS` nếu cần.
 
 ### Khởi động Logstash
 
@@ -212,7 +212,7 @@ Biến `LOGSTASH_HOST` mặc định là `localhost` cho lần chạy từ host;
 Script gửi sự kiện mẫu dưới đây, kèm newline bắt buộc:
 
 ```json
-{"service":"storex-backend","level":"INFO","message":"Order created successfully","order_id":1001}
+{"app_name":"storex-backend","service":"storex-backend","level":"INFO","message":"Order created successfully","order_id":1001}
 ```
 
 Có thể gửi một sự kiện khác bằng Python:
@@ -222,6 +222,7 @@ import json
 import socket
 
 data = {
+    "app_name": "storex-backend",
     "service": "storex-backend",
     "level": "INFO",
     "message": "Order created successfully",
@@ -240,7 +241,7 @@ Sau khi gửi test event, kiểm tra index và document:
 
 ```bash
 curl "http://localhost:9200/_cat/indices?v"
-curl "http://localhost:9200/storex-logs-*/_search?pretty"
+curl "http://localhost:9200/storex-backend-*/_search?pretty"
 ```
 
 Trong kết quả `_source`, xác nhận `service`, `level`, `message`, `order_id` là các trường riêng. Kiểm tra Logstash stdout để thấy event parse:
@@ -249,7 +250,7 @@ Trong kết quả `_source`, xác nhận `service`, `level`, `message`, `order_i
 docker compose logs --tail=100 logstash
 ```
 
-Trong [Kibana](http://localhost:5601), vào **Stack Management → Data Views**, tạo Data View `storex-logs-*`, chọn `@timestamp` làm trường thời gian, rồi mở **Discover** để xem sự kiện. Nếu chưa thấy dữ liệu, mở rộng khoảng thời gian chọn trong Discover.
+Trong [Kibana](http://localhost:5601), vào **Stack Management → Data Views**, tạo Data View `storex-backend-*`, chọn `@timestamp` làm trường thời gian, rồi mở **Discover** để xem sự kiện. Nếu chưa thấy dữ liệu, mở rộng khoảng thời gian chọn trong Discover.
 
 ### Lỗi thường gặp
 
@@ -258,3 +259,74 @@ Trong [Kibana](http://localhost:5601), vào **Stack Management → Data Views**,
 - **Không có document trong Elasticsearch:** xác nhận Elasticsearch healthy, Logstash cùng network `efk`, output host là `http://elasticsearch:9200`, và chờ pipeline flush/ghi index.
 - **Document chứa JSON nguyên chuỗi hoặc không có trường:** gửi đúng một JSON object trên mỗi dòng, kết thúc bằng `\n`, và kiểm tra input `codec => json_lines`.
 - **Không thấy document trong Kibana:** xác nhận Data View là `storex-logs-*`, trường thời gian `@timestamp` và khoảng thời gian Discover bao gồm lúc gửi test event.
+
+## 11. Bài thực hành 3 — Phân loại log theo service
+
+### Mục tiêu và dynamic index
+
+Logstash chọn index Elasticsearch theo trường `app_name` của từng JSON event. Cấu hình trong [logstash.conf](./logstash/pipeline/logstash.conf):
+
+```text
+index => "%{[app_name]}-%{+YYYY.MM.dd}"
+```
+
+- `%{[app_name]}` là sprintf field reference của Logstash: giá trị trường `app_name` trong event được dùng làm phần tên index, không cần hardcode từng ứng dụng trong output.
+- `%{+YYYY.MM.dd}` tạo phần ngày từ `@timestamp` của event, ví dụ `2026.11.03`.
+- Vì vậy log `user-service` và `order-service` trong cùng pipeline được ghi lần lượt vào `user-service-2026.11.03` và `order-service-2026.11.03`.
+
+Pipeline chuẩn hóa `app_name` thành chữ thường và thay ký tự không hợp lệ bằng dấu `-`, để tên index tuân thủ quy tắc Elasticsearch. Nếu trường bị thiếu hoặc rỗng, giá trị mặc định là `unknown-service`; các tên bắt đầu bằng `_` hoặc `-` được chuẩn hóa để không tạo tên index không hợp lệ. Giá trị đã chuẩn hóa vẫn được lưu trong document.
+
+### Chạy cấu hình và kiểm thử
+
+Từ thư mục project, kiểm tra Compose rồi khởi động lại Logstash để nạp pipeline đã mount:
+
+```bash
+docker compose config
+docker compose restart logstash
+docker compose ps -a
+docker compose logs --tail=100 logstash
+```
+
+Chạy script kiểm thử trên host:
+
+```bash
+python logstash/test_index_routing.py
+```
+
+Script gửi lần lượt bốn JSON Lines events (mỗi event kết thúc bằng `\n`): hai cho `user-service` và hai cho `order-service`. Nếu Python chưa có trên host, chạy script trong container ứng dụng đang nằm trên network Compose:
+
+```powershell
+docker cp .\logstash\test_index_routing.py efk-stack-api-one-1:/tmp/test_index_routing.py
+docker exec -e LOGSTASH_HOST=logstash efk-stack-api-one-1 python /tmp/test_index_routing.py
+```
+
+Khi chạy script từ chính host, không cần đặt `LOGSTASH_HOST`; giá trị mặc định là `localhost`. Từ một container trong network Compose phải đặt `LOGSTASH_HOST=logstash`.
+
+### Xác minh Elasticsearch
+
+Chờ vài giây để Logstash ghi event, sau đó xem indices và từng nhóm:
+
+```bash
+curl "http://localhost:9200/_cat/indices?v"
+curl "http://localhost:9200/user-service-*/_search?pretty"
+curl "http://localhost:9200/order-service-*/_search?pretty"
+```
+
+Kết quả cần có hai index ngày hiện tại, `user-service-YYYY.MM.dd` và `order-service-YYYY.MM.dd`. Mỗi index cần chứa hai document thuộc đúng service, với `app_name`, `level`, `message` và trường ID riêng (`user_id` hoặc `order_id`) được parse thành các trường có cấu trúc. Trường `app_name` không được xóa khỏi event.
+
+### Xem trong Kibana
+
+Mở [Kibana](http://localhost:5601), vào **Stack Management → Data Views** và tạo hai Data View:
+
+1. `user-service-*`, chọn `@timestamp` làm trường thời gian.
+2. `order-service-*`, chọn `@timestamp` làm trường thời gian.
+
+Mở **Discover**, chọn Data View cần kiểm tra và đặt khoảng thời gian bao gồm lúc chạy script. KQL có thể lọc `app_name : "user-service"` hoặc `level : "ERROR"`.
+
+### Lỗi thường gặp
+
+- **Cả hai service vẫn vào index cũ:** xem `docker compose logs --tail=100 logstash`, xác nhận pipeline được mount vào `/usr/share/logstash/pipeline/logstash.conf`, rồi chạy `docker compose restart logstash`.
+- **Tên index không hợp lệ hoặc event vào `unknown-service`:** bảo đảm JSON có `app_name` không rỗng; pipeline chuẩn hóa ký tự và dùng `unknown-service` khi trường thiếu/rỗng.
+- **Chỉ một index được tạo:** gửi ít nhất một event cho mỗi `app_name`, đảm bảo mỗi JSON kết thúc bằng newline và chờ Logstash ghi dữ liệu.
+- **Không thấy document:** xác nhận input TCP port `5000`, Logstash đang chạy, Elasticsearch healthy và kiểm tra đúng ngày/index pattern.
+- **Không thấy log trong Kibana:** tạo Data View riêng cho từng pattern ở trên, chọn `@timestamp` và mở rộng time range.

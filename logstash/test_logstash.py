@@ -4,6 +4,7 @@ import socket
 
 
 event = {
+    "app_name": "storex-backend",
     "service": "storex-backend",
     "level": "INFO",
     "message": "Order created successfully",
