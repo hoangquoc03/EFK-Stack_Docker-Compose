@@ -37,6 +37,8 @@ EFK-Stack/
 │   ├── pipeline/
 │   │   └── logstash.conf
 │   └── test_logstash.py
+├── filebeat/
+│   └── filebeat.yml
 ├── spring-boot-demo/
 │   ├── Dockerfile
 │   ├── pom.xml
@@ -344,7 +346,7 @@ Mở **Discover**, chọn Data View cần kiểm tra và đặt khoảng thời 
 
 ### Mục tiêu và nguyên nhân log bị mất/chậm
 
-Module demo Spring Boot tại `spring-boot-demo/` gửi JSON TCP đến Logstash (`logstash:5000`) và được Logstash định tuyến vào index `storex-backend-YYYY.MM.dd`. Maven chọn Spring Boot `3.2.4` (Java 17, Logback `1.4.x`) và `logstash-logback-encoder` `7.4`, phiên bản encoder tương thích Logback 1.3/1.4.
+Module demo Spring Boot tại `spring-boot-demo/` có các profile `direct` và `async` để thực hành gửi JSON TCP đến Logstash (`logstash:5000`) và được Logstash định tuyến vào index `storex-backend-YYYY.MM.dd`. Từ Bài thực hành 5, profile mặc định `file` chỉ ghi JSON log vào shared volume để Filebeat thu thập. Maven chọn Spring Boot `3.2.4` (Java 17, Logback `1.4.x`) và `logstash-logback-encoder` `7.4`, phiên bản encoder tương thích Logback 1.3/1.4.
 
 Khi đích TCP chậm hoặc ngắt, thao tác ghi log có thể bị chậm do buffer đầy, reconnect hoặc backpressure. Nếu request xử lý log ngay trên luồng nghiệp vụ, việc chờ có thể làm tăng latency. Mạng TCP cũng không đồng nghĩa với việc event đã được xác nhận ghi bền vững vào Elasticsearch.
 
@@ -367,24 +369,28 @@ Ba mục tiêu cần phân biệt: **không block ứng dụng**, **không mất
 
 ### Chạy ứng dụng và kiểm tra API
 
-Compose thêm service `storex-backend` vào network `efk`, publish API trên `127.0.0.1:18080` (cổng host `8080` đã được một dịch vụ khác sử dụng trên máy này) và kết nối Logstash bằng tên DNS `logstash`.
+Compose thêm service `storex-backend` vào network `efk` và publish API trên `127.0.0.1:18080` (cổng host `8080` đã được một dịch vụ khác sử dụng trên máy này). Ở profile `async`/`direct`, app kết nối Logstash bằng tên DNS `logstash`; profile mặc định `file` chỉ ghi vào shared volume.
 
 ```bash
 docker compose config
+$env:STOREX_LOGGING_PROFILE = "async"
 docker compose up -d --build storex-backend
+Remove-Item Env:STOREX_LOGGING_PROFILE
 docker compose ps -a
 docker compose logs -f storex-backend
 ```
 
 Có thể chạy module ngoài Docker với JDK 17+ và Maven:
 
-```bash
+```powershell
 cd spring-boot-demo
 mvn test
+$env:SPRING_PROFILES_ACTIVE = "async"
 mvn spring-boot:run
+Remove-Item Env:SPRING_PROFILES_ACTIVE
 ```
 
-Gửi một request kiểm tra các mức INFO/WARN/ERROR:
+Chọn profile `async` để kiểm tra luồng Logstash TCP của Bài 4; profile mặc định `file` yêu cầu mount `/var/log/storex` như khi chạy bằng Compose. Gửi một request kiểm tra các mức INFO/WARN/ERROR:
 
 ```bash
 curl -i http://localhost:18080/test-log
@@ -423,7 +429,7 @@ Script giới hạn số request (50.000), concurrency (100) và có timeout đ�
 
 ### So sánh direct và async, mô phỏng Logstash ngắt kết nối
 
-`async` là cấu hình mặc định. Để tạm chuyển sang appender TCP trực tiếp khi so sánh trong PowerShell:
+Bài 4 yêu cầu chọn tường minh profile `async` hoặc `direct` vì profile mặc định hiện là `file`. Để tạm chuyển sang appender TCP trực tiếp khi so sánh trong PowerShell:
 
 ```powershell
 docker compose stop logstash
@@ -457,3 +463,94 @@ docker compose logs --tail=100 logstash
 ```
 
 Event cần có `app_name`, `@timestamp`, `level`, `message` và MDC `request_id`. Trong lần shutdown bình thường, `maxFlushTime` giới hạn thời gian chờ; khi queue đã đầy với `neverBlock=true`, sự kiện bị rơi có thể không xuất hiện trong Elasticsearch. Muốn bảo đảm bền vững hơn cần buffer/transport có persistence và chính sách xác nhận, không chỉ thêm AsyncAppender.
+
+## 13. Bài thực hành 5 — Filebeat đọc log file
+
+### Mục tiêu và kiến trúc
+
+Bài này chuyển đường thu thập log mặc định từ TCP sang file:
+
+```text
+Spring Boot -- ghi JSONL --> storex-logs (named volume)
+                                   |
+                                   | mount read-only
+                                   v
+                         Filebeat 7.17.0 -- HTTP :9200 --> Elasticsearch --> Kibana
+```
+
+Spring Boot chỉ biết đường dẫn `/var/log/storex/storex.log`; nó không cần kết nối hoặc cấu hình Filebeat, Logstash hay Elasticsearch. Logstash vẫn được giữ nguyên để thực hành các bài 2–4, nhưng `storex-backend` không còn phụ thuộc vào service Logstash và profile mặc định không gửi TCP.
+
+### Cấu hình Logback ghi file
+
+Profile `file` là mặc định. `RollingFileAppender` ghi JSON một event mỗi dòng vào `/var/log/storex/storex.log`; `LogstashEncoder` tạo các trường `@timestamp`, `level`, `message` và `app_name`. File được xoay theo ngày hoặc khi đạt 50 MB; lưu tối đa 7 ngày và giới hạn tổng file đã xoay ở 1 GB. API `/test-log` ghi INFO `User login successfully`, WARN `User login failed` và ERROR `Order processing failed`. `/generate-logs?count=1000` sinh nhiều event; `count` giới hạn từ 1 đến 20.000.
+
+Để giữ nội dung Bài 4, profile `async` và `direct` vẫn được khai báo trong `logback-spring.xml`. Chỉ chọn các profile đó khi muốn gửi qua Logstash TCP; profile `file` là cấu hình bình thường cho luồng bài 5.
+
+### Filebeat và shared volume
+
+Cấu hình ở [filebeat.yml](./filebeat/filebeat.yml):
+
+- `filestream` theo dõi `/var/log/storex/storex.log` và các file cuộn `storex.*.log`, để xử lý cả log còn lại khi file được rotate; ID input cố định giúp registry nhận diện input ổn định.
+- Parser `ndjson` giải mã từng dòng JSON thành các trường event ở root, thay vì giữ JSON trong một chuỗi message.
+- Filebeat bổ sung `app_name=storex-backend` và gửi trực tiếp tới `http://elasticsearch:9200`.
+- Output dùng index `storex-filebeat-YYYY.MM.dd`; template riêng được khai báo và ILM tắt để index tùy chỉnh không bị thay thế bởi tên ILM mặc định.
+- Compose mount named volume `storex-logs` ghi được cho ứng dụng, nhưng chỉ đọc (`:ro`) cho Filebeat. `filebeat-data` riêng lưu registry/checkpoint vị trí đọc, giúp Filebeat tiếp tục theo dõi sau restart.
+
+Registry lưu trạng thái đọc cục bộ chứ không phải bản sao bền vững của toàn bộ log. Nếu xóa `filebeat-data`, thay đổi file identity/path, hoặc file bị rotate/xóa trước khi đọc hết, có thể đọc lại hoặc mất một phần dữ liệu. Filebeat và registry không bảo đảm tuyệt đối không mất log.
+
+### Khởi động và kiểm tra
+
+Khởi động hoặc cập nhật hai service liên quan mà không xóa dữ liệu hiện có:
+
+```powershell
+docker compose config
+docker compose up -d --build storex-backend filebeat
+docker compose ps -a
+```
+
+Gọi endpoint và kiểm tra file bên trong container Spring Boot:
+
+```powershell
+curl.exe -i http://localhost:18080/test-log
+curl.exe -i "http://localhost:18080/generate-logs?count=1000"
+docker compose exec storex-backend sh -c "tail -n 20 /var/log/storex/storex.log"
+```
+
+File là JSON Lines. Mỗi dòng là một event độc lập, có `@timestamp`, `level`, `message`, `app_name`; `request_id` được thêm bởi filter nếu có request HTTP. Filebeat chạy root để có thể đọc volume; mount file log của nó là read-only.
+
+Kiểm tra log Filebeat và Elasticsearch:
+
+```powershell
+docker compose logs --tail=100 filebeat
+curl.exe "http://localhost:9200/_cat/indices?v"
+curl.exe "http://localhost:9200/storex-filebeat-*/_search?pretty"
+```
+
+Kết quả mong đợi là index `storex-filebeat-YYYY.MM.dd` có document với các trường `message`, `level`, `app_name` và `@timestamp`. Thử gọi `/test-log` lần nữa để xác nhận dòng mới được đọc mà không cần restart Filebeat. Event đã đọc thường không bị đọc lại sau restart khi named volume `filebeat-data` còn nguyên.
+
+### Xem trong Kibana
+
+Mở [Kibana](http://localhost:5601), vào **Stack Management → Data Views**, tạo Data View `storex-filebeat-*` và chọn `@timestamp` làm trường thời gian. Trong **Discover**, chọn Data View đó, chỉnh time range cho phù hợp; có thể lọc bằng KQL như `app_name : "storex-backend"` hoặc `level : "ERROR"`.
+
+### So sánh Logstash TCP và Filebeat đọc file
+
+| Tiêu chí | Spring Boot → Logstash TCP | Spring Boot → file → Filebeat |
+|---|---|---|
+| Phụ thuộc ứng dụng | App phải biết hostname/port Logstash và encoder TCP | App chỉ ghi file; collector tách rời |
+| Ảnh hưởng hiệu năng | Gửi TCP trực tiếp có thể chịu backpressure; AsyncAppender giảm block nhưng queue có thể đầy | Ghi file cục bộ thường tách khỏi network; I/O đĩa và rotation vẫn ảnh hưởng |
+| Buffer | TCP appender/queue ứng dụng và buffer Logstash tùy cấu hình | File trên volume là buffer tạm; registry theo dõi offset, không phải buffer bền vững vô hạn |
+| Theo dõi file | Không áp dụng | Filestream theo dõi file đang ghi và các dòng mới |
+| Retry | TCP reconnect/retry tùy appender và Logstash | Filebeat retry gửi event khi Elasticsearch tạm không sẵn sàng |
+| Phục hồi restart | Queue trong bộ nhớ có thể mất khi app dừng bất thường | File còn trên volume và registry được giữ có thể tiếp tục từ offset |
+| Nguy cơ mất log | Mất khi queue đầy, kết nối/tiến trình lỗi hoặc event chưa được xác nhận bền vững | Mất khi volume/file bị xóa, rotation trước khi đọc hết, registry mất hoặc hết dung lượng; không có bảo đảm tuyệt đối |
+
+### Lỗi thường gặp
+
+- **Filebeat không đọc được cấu hình:** xem `docker compose logs filebeat`; xác nhận mount `filebeat.yml` đúng, YAML hợp lệ và `--strict.perms=false` được truyền trong môi trường Docker Desktop.
+- **Permission denied khi đọc log:** đảm bảo Filebeat chạy `user: root`, volume được mount đúng và app có quyền ghi vào `storex-logs`; phía Filebeat vẫn mount `:ro`.
+- **Không có `level`/`message`:** file appender phải dùng `LogstashEncoder` phát JSON Lines và Filebeat phải cấu hình parser `ndjson`; log plaintext sẽ không tự tách thành các trường đó.
+- **Index không xuất hiện:** chờ Filebeat kết nối Elasticsearch, xem log output, kiểm tra `elasticsearch` hostname/port 9200, template và `setup.ilm.enabled: false`.
+- **Log cũ đọc lại sau khi thay cấu hình:** kiểm tra `filebeat-data` và ID filestream ổn định; không xóa registry để “sửa” nếu không muốn Filebeat đọc lại dữ liệu.
+- **Ổ đĩa tăng nhanh:** logrotate nội bộ giới hạn file cuộn theo 7 ngày/1 GB; kiểm tra dung lượng volume và không xóa volume khi cần giữ dữ liệu.
+
+Để dừng các service nhưng giữ dữ liệu, dùng `docker compose stop`. Không dùng `docker compose down -v`; thao tác đó sẽ xóa cả các named volumes dữ liệu.

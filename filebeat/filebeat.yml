@@ -1,0 +1,29 @@
+filebeat.inputs:
+  - type: filestream
+    id: storex-log-input
+    enabled: true
+    paths:
+      - /var/log/storex/storex.log
+      - /var/log/storex/storex.*.log
+    parsers:
+      - ndjson:
+          target: ""
+          overwrite_keys: true
+          add_error_key: true
+    fields:
+      app_name: storex-backend
+    fields_under_root: true
+    prospector.scanner.check_interval: 2s
+
+output.elasticsearch:
+  hosts:
+    - http://elasticsearch:9200
+  index: "storex-filebeat-%{+yyyy.MM.dd}"
+
+setup.template.name: storex-filebeat
+setup.template.pattern: "storex-filebeat-*"
+setup.ilm.enabled: false
+
+logging.level: info
+logging.to_stderr: true
+logging.to_files: false

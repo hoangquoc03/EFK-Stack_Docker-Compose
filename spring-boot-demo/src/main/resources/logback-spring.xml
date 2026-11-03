@@ -1,36 +1,51 @@
 <configuration>
-    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
-        <encoder>
-            <pattern>%d{ISO8601} %-5level [%X{request_id:-}] %logger{36} - %msg%n</pattern>
-        </encoder>
-    </appender>
-
-    <appender name="LOGSTASH" class="net.logstash.logback.appender.LogstashTcpSocketAppender">
-        <destination>logstash:5000</destination>
+    <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>/var/log/storex/storex.log</file>
         <encoder class="net.logstash.logback.encoder.LogstashEncoder">
             <customFields>{"app_name":"storex-backend"}</customFields>
         </encoder>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>/var/log/storex/storex.%d{yyyy-MM-dd}.%i.log</fileNamePattern>
+            <maxFileSize>50MB</maxFileSize>
+            <maxHistory>7</maxHistory>
+            <totalSizeCap>1GB</totalSizeCap>
+        </rollingPolicy>
     </appender>
 
-    <appender name="ASYNC_LOGSTASH" class="ch.qos.logback.classic.AsyncAppender">
-        <queueSize>8192</queueSize>
-        <discardingThreshold>0</discardingThreshold>
-        <neverBlock>true</neverBlock>
-        <maxFlushTime>3000</maxFlushTime>
-        <appender-ref ref="LOGSTASH"/>
-    </appender>
+    <springProfile name="async | direct">
+        <appender name="LOGSTASH" class="net.logstash.logback.appender.LogstashTcpSocketAppender">
+            <destination>logstash:5000</destination>
+            <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+                <customFields>{"app_name":"storex-backend"}</customFields>
+            </encoder>
+        </appender>
+    </springProfile>
+
+    <springProfile name="async">
+        <appender name="ASYNC_LOGSTASH" class="ch.qos.logback.classic.AsyncAppender">
+            <queueSize>8192</queueSize>
+            <discardingThreshold>0</discardingThreshold>
+            <neverBlock>true</neverBlock>
+            <maxFlushTime>3000</maxFlushTime>
+            <appender-ref ref="LOGSTASH"/>
+        </appender>
+    </springProfile>
+
+    <springProfile name="file">
+        <root level="INFO">
+            <appender-ref ref="FILE"/>
+        </root>
+    </springProfile>
 
     <springProfile name="async">
         <root level="INFO">
             <appender-ref ref="ASYNC_LOGSTASH"/>
-            <appender-ref ref="CONSOLE"/>
         </root>
     </springProfile>
 
     <springProfile name="direct">
         <root level="INFO">
             <appender-ref ref="LOGSTASH"/>
-            <appender-ref ref="CONSOLE"/>
         </root>
     </springProfile>
 </configuration>

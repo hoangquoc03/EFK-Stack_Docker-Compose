@@ -19,9 +19,9 @@ public class LoggingController {
     @GetMapping("/test-log")
     public ResponseEntity<LogResponse> testLog() {
         String eventId = UUID.randomUUID().toString();
-        LOGGER.info("Test INFO event event_id={} timestamp={}", eventId, Instant.now());
-        LOGGER.warn("Test WARN event event_id={} timestamp={}", eventId, Instant.now());
-        LOGGER.error("Test ERROR event event_id={} timestamp={}", eventId, Instant.now());
+        LOGGER.info("User login successfully event_id={} timestamp={}", eventId, Instant.now());
+        LOGGER.warn("User login failed event_id={} timestamp={}", eventId, Instant.now());
+        LOGGER.error("Order processing failed event_id={} timestamp={}", eventId, Instant.now());
         return ResponseEntity.ok(new LogResponse("Logged INFO, WARN, and ERROR", 3, eventId));
     }
 

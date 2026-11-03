@@ -14,3 +14,5 @@ fluentd/buffer/
 data/
 elasticsearch-data/
 spring-boot-demo/target/
+filebeat/data/
+storex-logs/
