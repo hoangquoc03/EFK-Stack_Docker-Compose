@@ -13,3 +13,4 @@ Thumbs.db
 fluentd/buffer/
 data/
 elasticsearch-data/
+spring-boot-demo/target/

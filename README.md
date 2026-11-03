@@ -37,6 +37,15 @@ EFK-Stack/
 │   ├── pipeline/
 │   │   └── logstash.conf
 │   └── test_logstash.py
+├── spring-boot-demo/
+│   ├── Dockerfile
+│   ├── pom.xml
+│   ├── test_load.py
+│   └── src/main/
+│       ├── java/com/storex/demo/
+│       └── resources/
+│           ├── application.properties
+│           └── logback-spring.xml
 └── app/
     ├── Dockerfile
     └── app.py
@@ -330,3 +339,121 @@ Mở **Discover**, chọn Data View cần kiểm tra và đặt khoảng thời 
 - **Chỉ một index được tạo:** gửi ít nhất một event cho mỗi `app_name`, đảm bảo mỗi JSON kết thúc bằng newline và chờ Logstash ghi dữ liệu.
 - **Không thấy document:** xác nhận input TCP port `5000`, Logstash đang chạy, Elasticsearch healthy và kiểm tra đúng ngày/index pattern.
 - **Không thấy log trong Kibana:** tạo Data View riêng cho từng pattern ở trên, chọn `@timestamp` và mở rộng time range.
+
+## 12. Bài thực hành 4 — Hạn chế ảnh hưởng khi Logstash nghẽn
+
+### Mục tiêu và nguyên nhân log bị mất/chậm
+
+Module demo Spring Boot tại `spring-boot-demo/` gửi JSON TCP đến Logstash (`logstash:5000`) và được Logstash định tuyến vào index `storex-backend-YYYY.MM.dd`. Maven chọn Spring Boot `3.2.4` (Java 17, Logback `1.4.x`) và `logstash-logback-encoder` `7.4`, phiên bản encoder tương thích Logback 1.3/1.4.
+
+Khi đích TCP chậm hoặc ngắt, thao tác ghi log có thể bị chậm do buffer đầy, reconnect hoặc backpressure. Nếu request xử lý log ngay trên luồng nghiệp vụ, việc chờ có thể làm tăng latency. Mạng TCP cũng không đồng nghĩa với việc event đã được xác nhận ghi bền vững vào Elasticsearch.
+
+```text
+Trực tiếp:   request thread -> LogstashTcpSocketAppender -> TCP -> Logstash -> Elasticsearch
+Bất đồng bộ: request thread -> AsyncAppender queue -> TCP appender -> TCP -> Logstash -> Elasticsearch
+```
+
+### AsyncAppender và trade-off
+
+`logback-spring.xml` mặc định dùng Spring profile `async`; profile `direct` giữ cấu hình so sánh. Trong profile `async`, root logger tham chiếu `ASYNC_LOGSTASH`, không gọi appender TCP trực tiếp.
+
+- `queueSize=8192`: số sự kiện chờ tối đa trong hàng đợi Logback; bộ nhớ thực tế phụ thuộc kích thước event. Đây không phải giới hạn bytes và không phải hàng đợi bền vững.
+- `discardingThreshold=0`: tắt việc chủ động loại bỏ sớm các log mức thấp khi hàng đợi còn ít chỗ. Khi hàng đợi đầy, event mới vẫn có thể bị loại vì `neverBlock=true`.
+- `neverBlock=true`: producer không chờ để thêm event khi queue đã đầy; request ít bị ảnh hưởng hơn nhưng log có thể bị mất.
+- `maxFlushTime=3000`: khi ứng dụng shutdown bình thường, AsyncAppender chờ tối đa 3000 ms để consumer xử lý queue. Đây không phải cam kết flush khi process bị kill, máy mất điện hoặc quá trình gửi TCP chưa được Elasticsearch xác nhận.
+- `LogstashTcpSocketAppender` cũng có cơ chế gửi nền/buffer riêng; AsyncAppender bổ sung queue ở phía ứng dụng. Hai lớp buffer không tạo ra bảo đảm lưu trữ bền vững.
+
+Ba mục tiêu cần phân biệt: **không block ứng dụng**, **không mất log**, và **log được lưu bền vững**. Cấu hình này ưu tiên giảm block; queue đầy, process dừng đột ngột, lỗi mạng hoặc Logstash/Elasticsearch từ chối dữ liệu vẫn có thể làm mất event. Nếu yêu cầu audit/financial cần giao nhận tin cậy, cân nhắc broker/persistent queue có disk, xác nhận/retention phù hợp và cơ chế retry/quan sát được. Cần đo tải thực tế ở mức mục tiêu 10.000 events/giây; cấu hình demo không tự bảo đảm throughput đó.
+
+### Chạy ứng dụng và kiểm tra API
+
+Compose thêm service `storex-backend` vào network `efk`, publish API trên `127.0.0.1:18080` (cổng host `8080` đã được một dịch vụ khác sử dụng trên máy này) và kết nối Logstash bằng tên DNS `logstash`.
+
+```bash
+docker compose config
+docker compose up -d --build storex-backend
+docker compose ps -a
+docker compose logs -f storex-backend
+```
+
+Có thể chạy module ngoài Docker với JDK 17+ và Maven:
+
+```bash
+cd spring-boot-demo
+mvn test
+mvn spring-boot:run
+```
+
+Gửi một request kiểm tra các mức INFO/WARN/ERROR:
+
+```bash
+curl -i http://localhost:18080/test-log
+```
+
+Tạo batch log có giới hạn:
+
+```bash
+curl -i "http://localhost:18080/generate-logs?count=10000"
+```
+
+`count` mặc định là `10000`, hợp lệ từ `1` đến `20000`; giá trị ngoài giới hạn trả HTTP 400. Mỗi request có `request_id` (cũng trả về header `X-Request-Id`); encoder thêm `app_name=storex-backend` và `@timestamp` vào event JSON.
+
+### Đo latency API
+
+Script `spring-boot-demo/test_load.py` đo tổng thời gian, latency trung bình, số request thành công/thất bại. Ví dụ gửi 1000 request với tối đa 20 worker:
+
+```bash
+python spring-boot-demo/test_load.py --requests 1000 --concurrency 20
+```
+
+Nếu host chưa cài Python, chạy script trong container ứng dụng mẫu trên cùng Compose network:
+
+```powershell
+docker cp .\spring-boot-demo\test_load.py efk-stack-api-one-1:/tmp/test_load.py
+docker exec efk-stack-api-one-1 python /tmp/test_load.py --url http://storex-backend:8080/test-log --requests 100 --concurrency 5
+```
+
+Có thể chạy batch sinh 1000 log, 10 lần để giới hạn tổng tải:
+
+```bash
+python spring-boot-demo/test_load.py --url "http://localhost:18080/generate-logs?count=1000" --requests 10 --concurrency 4
+```
+
+Script giới hạn số request (50.000), concurrency (100) và có timeout để không chạy vô hạn. Concurrency là số client; Spring Boot có giới hạn thread riêng nên kết quả cần được diễn giải theo cấu hình máy.
+
+### So sánh direct và async, mô phỏng Logstash ngắt kết nối
+
+`async` là cấu hình mặc định. Để tạm chuyển sang appender TCP trực tiếp khi so sánh trong PowerShell:
+
+```powershell
+docker compose stop logstash
+$env:STOREX_LOGGING_PROFILE = "direct"
+docker compose up -d --no-deps --force-recreate storex-backend
+Remove-Item Env:STOREX_LOGGING_PROFILE
+python spring-boot-demo/test_load.py --requests 100 --concurrency 5
+```
+
+Sau đó khởi động lại ứng dụng ở chế độ AsyncAppender và khôi phục Logstash:
+
+```powershell
+$env:STOREX_LOGGING_PROFILE = "async"
+docker compose up -d --no-deps --force-recreate storex-backend
+Remove-Item Env:STOREX_LOGGING_PROFILE
+docker compose start logstash
+python spring-boot-demo/test_load.py --requests 100 --concurrency 5
+```
+
+Chỉ dừng service Logstash demo; không dừng Elasticsearch/Kibana, không xóa volumes. So sánh thời gian phản hồi, tỷ lệ thành công và log nhận được sau khi Logstash hoạt động lại. Giữ batch nhỏ khi thử direct mode; tăng tải chỉ trong môi trường thử nghiệm. Không chạy ngập 10.000 events/giây trên máy cá nhân để kết luận về production. Khi queue đầy, profile async loại event mới thay vì block producer; direct mode bỏ outer queue nhưng TCP appender vẫn có buffer và hành vi riêng. Đây là minh họa trade-off, không phải bảo đảm không mất log.
+
+AsyncAppender queue không có metric endpoint bật trong demo. Để quan sát queue khi benchmark, cần bật/thu thập Logback JMX hoặc thêm instrumentation/metrics có kiểm soát; không nên suy ra queue còn chỗ chỉ từ HTTP status.
+
+### Xem dữ liệu và hạn chế
+
+Logstash output theo `app_name`, do đó mở [Kibana](http://localhost:5601), tạo Data View `storex-backend-*` với `@timestamp`, rồi dùng Discover. Có thể kiểm tra trực tiếp:
+
+```bash
+curl "http://localhost:9200/storex-backend-*/_search?pretty"
+docker compose logs --tail=100 logstash
+```
+
+Event cần có `app_name`, `@timestamp`, `level`, `message` và MDC `request_id`. Trong lần shutdown bình thường, `maxFlushTime` giới hạn thời gian chờ; khi queue đã đầy với `neverBlock=true`, sự kiện bị rơi có thể không xuất hiện trong Elasticsearch. Muốn bảo đảm bền vững hơn cần buffer/transport có persistence và chính sách xác nhận, không chỉ thêm AsyncAppender.

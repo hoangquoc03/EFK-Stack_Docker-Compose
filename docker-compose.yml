@@ -58,6 +58,19 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  storex-backend:
+    build:
+      context: ./spring-boot-demo
+    environment:
+      SPRING_PROFILES_ACTIVE: ${STOREX_LOGGING_PROFILE:-async}
+    ports:
+      - "127.0.0.1:18080:8080"
+    networks:
+      - efk
+    depends_on:
+      - logstash
+    restart: unless-stopped
+
   fluentd:
     build:
       context: ./fluentd
